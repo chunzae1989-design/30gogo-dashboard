@@ -1,0 +1,13 @@
+.env
+.env.*
+node_modules/
+.playwright-cli/
+.DS_Store
+__pycache__/
+*.pyc
+*.log
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+toss-order-audit.jsonl
+local-runtime/
