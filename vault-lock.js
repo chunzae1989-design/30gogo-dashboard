@@ -188,11 +188,23 @@
     unlockedPayload = payload;
     onUnlock(payload);
     document.body.classList.remove("vault-locked");
-    document.getElementById("vaultForm").hidden = false;
-    document.getElementById("vaultResume").hidden = true;
-    document.getElementById("vaultPassphrase").value = "";
+    const form = document.getElementById("vaultForm");
+    const resume = document.getElementById("vaultResume");
+    const passphrase = document.getElementById("vaultPassphrase");
+    if (form) form.hidden = false;
+    if (resume) resume.hidden = true;
+    if (passphrase) passphrase.value = "";
     if (!localRuntime) installDeviceLockButton();
     resetIdleTimer();
+  }
+
+  function showLocalError() {
+    mount();
+    document.getElementById("vaultTitle").textContent = "로컬 데이터를 열 수 없습니다";
+    document.getElementById("vaultDescription").textContent = "로컬 서버 상태를 확인한 뒤 페이지를 새로고침하세요.";
+    document.getElementById("vaultForm").hidden = true;
+    document.getElementById("vaultResume").hidden = true;
+    showError();
   }
 
   async function resumeFromDeviceKey() {
@@ -248,18 +260,22 @@
     if (started) return;
     started = true;
     onUnlock = options.onUnlock;
-    mount();
+    localRuntime = document.querySelector('meta[name="30gogo-local"]')?.content === "1";
 
-    try {
-      localRuntime = document.querySelector('meta[name="30gogo-local"]')?.content === "1";
-      if (localRuntime) {
+    if (localRuntime) {
+      try {
         const response = await fetch("/__local/private-data", { cache: "no-store" });
         if (!response.ok) throw new Error("local data unavailable");
         const payload = await response.json();
         finishUnlock(payload, null);
-        return;
+      } catch {
+        showLocalError();
       }
+      return;
+    }
 
+    mount();
+    try {
       const response = await fetch(`portfolio.vault.json?v=${Date.now()}`, { cache: "no-store" });
       if (!response.ok) throw new Error("vault unavailable");
       envelope = await response.json();
