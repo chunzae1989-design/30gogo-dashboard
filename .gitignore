@@ -11,3 +11,4 @@ __pycache__/
 *.sqlite-wal
 toss-order-audit.jsonl
 local-runtime/
+valuation_cache.json

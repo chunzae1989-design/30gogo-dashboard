@@ -18,11 +18,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from dashboard_strategy import apply_qqq_new_money_policy, latest_daily_change, promote_latest_guru_cache
 from performance_core import OFFICIAL_START, build_performance
 
 ROOT = Path(__file__).resolve().parent
 PRIVATE_ROOT = Path.home() / ".30gogo" / "data"
 PRIVATE_SOURCE = PRIVATE_ROOT / "private-portfolio.json"
+VALUATION_CACHE_PATHS = [PRIVATE_ROOT / "valuation_cache.json", ROOT / "valuation_cache.json"]
 HISTORY_DB = PRIVATE_ROOT / "portfolio_history.sqlite"
 VAULT = ROOT / "portfolio.vault.json"
 OPENAPI_BASE = "https://openapi.tossinvest.com"
@@ -367,6 +369,36 @@ def sync_qqq_benchmark(client: TossReadOnlyClient) -> dict:
         return {"ok": False, "count": 0, "message": str(error)}
 
 
+def sync_guru_market_changes(payload: dict, client: TossReadOnlyClient) -> dict:
+    updated = 0
+    eligible = 0
+    market_as_of = now_dt().isoformat()
+    for guru in (payload.get("guruData") or {}).get("rows") or []:
+        ticker = str(guru.get("ticker") or "").upper()
+        if not ticker or ticker in EXCLUDE_TOSS:
+            continue
+        eligible += 1
+        try:
+            page = result(client.get("/api/v1/candles", {
+                "symbol": ticker,
+                "interval": "1d",
+                "count": 3,
+                "adjusted": "true",
+            })) or {}
+            change = latest_daily_change(page.get("candles") or [])
+            if not change:
+                continue
+            guru["changePct"] = change["changePct"]
+            guru["marketAsOf"] = market_as_of
+            updated += 1
+        except Exception:
+            continue
+    if updated:
+        payload["guruData"]["marketAsOf"] = market_as_of
+        payload["guruData"]["marketCoverage"] = {"updated": updated, "eligible": eligible}
+    return {"ok": updated > 0, "updated": updated, "eligible": eligible, "asOf": market_as_of if updated else None}
+
+
 def cash_flow_payload(connection: sqlite3.Connection) -> list[dict]:
     rows_found = connection.execute(
         "SELECT id,flow_date,amount_krw,kind,note,source,created_at FROM external_cash_flows WHERE flow_date>=? ORDER BY flow_date DESC,id DESC",
@@ -428,8 +460,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     payload = load_private()
+    guru_status = promote_latest_guru_cache(payload, VALUATION_CACHE_PATHS)
+    apply_qqq_new_money_policy(payload)
     client = TossReadOnlyClient()
     assets, snapshot = update_assets(payload, client)
+    guru_market_status = sync_guru_market_changes(payload, client)
     store_snapshot(assets, snapshot["usdKrw"])
     benchmark_status = sync_qqq_benchmark(client)
     payload["assets"] = assets
@@ -448,6 +483,8 @@ def main() -> int:
         "updatedCount": len(snapshot["updatedTickers"]),
         "historySnapshots": len(payload["portfolioHistory"]["snapshots"]),
         "benchmark": benchmark_status,
+        "guru": guru_status,
+        "guruMarket": guru_market_status,
         "performanceStatus": payload["performance"]["status"],
         "vault": str(VAULT),
     }, ensure_ascii=False))

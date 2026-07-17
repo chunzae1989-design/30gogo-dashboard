@@ -5,6 +5,8 @@
       --shadow:0 26px 90px rgba(0,0,0,.48);--r:26px;--max:1440px;--side:252px;
     }
     *{box-sizing:border-box}
+    .guru-lens-grid{grid-template-columns:120px repeat(7,84px)!important}
+    .guru-head{font-size:10px!important;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     html{scroll-behavior:smooth}
     body{
       margin:0;
