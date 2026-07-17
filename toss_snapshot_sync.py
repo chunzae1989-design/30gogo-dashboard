@@ -11,6 +11,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -378,6 +379,7 @@ def sync_guru_market_changes(payload: dict, client: TossReadOnlyClient) -> dict:
         if not ticker or ticker in EXCLUDE_TOSS:
             continue
         eligible += 1
+        time.sleep(0.25)
         try:
             page = result(client.get("/api/v1/candles", {
                 "symbol": ticker,
