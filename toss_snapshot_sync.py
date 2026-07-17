@@ -18,6 +18,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from performance_core import OFFICIAL_START, build_performance
+
 ROOT = Path(__file__).resolve().parent
 PRIVATE_ROOT = Path.home() / ".30gogo" / "data"
 PRIVATE_SOURCE = PRIVATE_ROOT / "private-portfolio.json"
@@ -234,6 +236,42 @@ def init_db(connection: sqlite3.Connection) -> None:
             FOREIGN KEY (snapshot_id) REFERENCES portfolio_snapshots(id) ON DELETE CASCADE
         )
     """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS external_cash_flows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            flow_date TEXT NOT NULL,
+            amount_krw REAL NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('deposit','withdrawal')),
+            note TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT 'manual',
+            created_at TEXT NOT NULL
+        )
+    """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS performance_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS benchmark_prices (
+            symbol TEXT NOT NULL,
+            price_date TEXT NOT NULL,
+            close_native REAL NOT NULL,
+            currency TEXT NOT NULL,
+            fetched_at TEXT NOT NULL,
+            PRIMARY KEY (symbol, price_date)
+        )
+    """)
+    connection.execute(
+        "INSERT OR IGNORE INTO performance_settings(key,value,updated_at) VALUES('official_start',?,?)",
+        (OFFICIAL_START, now_dt().isoformat()),
+    )
+    connection.execute(
+        "INSERT OR IGNORE INTO performance_settings(key,value,updated_at) VALUES('cash_flow_reviewed_through',?,?)",
+        (OFFICIAL_START, now_dt().isoformat()),
+    )
 
 
 def store_snapshot(assets: list[dict], usd_krw: float) -> None:
@@ -293,6 +331,78 @@ def history_payload(years: int) -> dict:
     return {"generatedAt": now_dt().isoformat(), "source": "Encrypted local SQLite history", "retentionYears": years, "snapshots": result_rows}
 
 
+def sync_qqq_benchmark(client: TossReadOnlyClient) -> dict:
+    try:
+        page = result(client.get("/api/v1/candles", {
+            "symbol": "QQQ",
+            "interval": "1d",
+            "count": 200,
+            "adjusted": "true",
+        })) or {}
+        candles = page.get("candles") if isinstance(page, dict) else []
+        if not isinstance(candles, list):
+            candles = []
+        with sqlite3.connect(HISTORY_DB) as connection:
+            init_db(connection)
+            connection.executemany(
+                """
+                INSERT INTO benchmark_prices(symbol,price_date,close_native,currency,fetched_at)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(symbol,price_date) DO UPDATE SET
+                    close_native=excluded.close_native,
+                    currency=excluded.currency,
+                    fetched_at=excluded.fetched_at
+                """,
+                [(
+                    "QQQ",
+                    str(row.get("timestamp") or "")[:10],
+                    float(row.get("closePrice") or 0),
+                    str(row.get("currency") or "USD").upper(),
+                    now_dt().isoformat(),
+                ) for row in candles if str(row.get("timestamp") or "")[:10] and float(row.get("closePrice") or 0) > 0],
+            )
+            connection.commit()
+        return {"ok": True, "count": len(candles)}
+    except Exception as error:
+        return {"ok": False, "count": 0, "message": str(error)}
+
+
+def cash_flow_payload(connection: sqlite3.Connection) -> list[dict]:
+    rows_found = connection.execute(
+        "SELECT id,flow_date,amount_krw,kind,note,source,created_at FROM external_cash_flows WHERE flow_date>=? ORDER BY flow_date DESC,id DESC",
+        (OFFICIAL_START,),
+    ).fetchall()
+    return [{
+        "id": row[0],
+        "date": row[1],
+        "amountKrw": row[2],
+        "kind": row[3],
+        "note": row[4],
+        "source": row[5],
+        "createdAt": row[6],
+    } for row in rows_found]
+
+
+def performance_payload(history: dict) -> dict:
+    with sqlite3.connect(HISTORY_DB) as connection:
+        init_db(connection)
+        settings = dict(connection.execute("SELECT key,value FROM performance_settings").fetchall())
+        benchmark = [{
+            "date": row[0], "close": row[1], "currency": row[2],
+        } for row in connection.execute(
+            "SELECT price_date,close_native,currency FROM benchmark_prices WHERE symbol='QQQ' AND price_date>=? ORDER BY price_date",
+            (OFFICIAL_START,),
+        ).fetchall()]
+        flows = cash_flow_payload(connection)
+    return build_performance(
+        history,
+        flows,
+        benchmark,
+        settings.get("cash_flow_reviewed_through"),
+        settings.get("official_start") or OFFICIAL_START,
+    )
+
+
 def publish(commit: bool, push: bool, as_of: str) -> str:
     subprocess.run(["node", "scripts/vault.mjs", "build"], cwd=ROOT, check=True)
     subprocess.run(["node", "scripts/security-check.mjs"], cwd=ROOT, check=True)
@@ -318,12 +428,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     payload = load_private()
-    assets, snapshot = update_assets(payload, TossReadOnlyClient())
+    client = TossReadOnlyClient()
+    assets, snapshot = update_assets(payload, client)
     store_snapshot(assets, snapshot["usdKrw"])
+    benchmark_status = sync_qqq_benchmark(client)
     payload["assets"] = assets
     payload["generatedAt"] = now_dt().isoformat()
+    payload["schemaVersion"] = 2
     payload["tossSnapshot"] = snapshot
     payload["portfolioHistory"] = history_payload(args.history_years)
+    payload["performance"] = performance_payload(payload["portfolioHistory"])
     PRIVATE_SOURCE.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.chmod(PRIVATE_SOURCE, 0o600)
     status = publish(args.commit, args.push, snapshot["asOf"])
@@ -333,6 +447,8 @@ def main() -> int:
         "asOf": snapshot["asOf"],
         "updatedCount": len(snapshot["updatedTickers"]),
         "historySnapshots": len(payload["portfolioHistory"]["snapshots"]),
+        "benchmark": benchmark_status,
+        "performanceStatus": payload["performance"]["status"],
         "vault": str(VAULT),
     }, ensure_ascii=False))
     return 0
