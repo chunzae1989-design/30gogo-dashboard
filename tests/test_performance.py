@@ -28,6 +28,9 @@ class PerformanceTest(unittest.TestCase):
         self.assertAlmostEqual(result["summary"]["portfolioReturn"], 0.21, places=8)
         self.assertAlmostEqual(result["summary"]["benchmarkReturn"], 0.10, places=8)
         self.assertAlmostEqual(result["summary"]["excessReturn"], 0.11, places=8)
+        self.assertIsNone(result["series"][0]["dailyProfitKrw"])
+        self.assertEqual(result["series"][1]["dailyProfitKrw"], 100)
+        self.assertEqual(result["series"][2]["dailyProfitKrw"], 120)
         self.assertEqual(result["status"], "official")
 
     def test_unreviewed_ledger_is_provisional(self):

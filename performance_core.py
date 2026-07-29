@@ -125,6 +125,7 @@ def build_performance(
         day = _day(snapshot.get("asOf"))
         value = float(snapshot.get("totalKrw") or 0)
         external_flow = 0.0 if index == 0 else flows_by_day.get(day, 0.0)
+        daily_profit = None if index == 0 else value - external_flow - previous_value
         daily_return = 0.0 if index == 0 or previous_value <= 0 else (value - external_flow) / previous_value - 1
         if index:
             cumulative *= 1 + daily_return
@@ -139,6 +140,7 @@ def build_performance(
             "date": day,
             "portfolioValueKrw": value,
             "externalFlowKrw": external_flow,
+            "dailyProfitKrw": daily_profit,
             "dailyReturn": daily_return,
             "portfolioIndex": cumulative * 100,
             "benchmarkIndex": benchmark_index,
