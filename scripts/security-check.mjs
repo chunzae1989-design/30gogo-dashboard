@@ -26,7 +26,7 @@ for (const file of tracked) {
   if (existsSync(resolve(root, file)) && forbiddenTracked.some((pattern) => pattern.test(file))) failures.push(`금지된 추적 파일: ${file}`);
 }
 
-const publicFiles = ["index.html", "app.js", "vault-lock.js", "qqq-core.js", "qqq-upgrade.js"];
+const publicFiles = ["index.html", "app.js", "vault-lock.js", "qqq-core.js", "qqq-upgrade.js", "stock-detail-core.js", "stock-detail.js", "guru-research-core.js", "guru-research.js"];
 const forbiddenPublic = [
   [/TOSS_CLIENT_(?:ID|SECRET)/i, "Toss 자격정보 변수"],
   [/tossAccessToken|accountSeq|X-Tossinvest-Account/i, "토큰 또는 계좌 식별자 코드"],

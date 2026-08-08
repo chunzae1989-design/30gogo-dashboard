@@ -18,6 +18,34 @@ Mac 로컬 관제 홈에서는 투자계좌의 외부 입금과 출금을 원장
 - 신규 투자금 기본축은 QQQ 55%, 현금 버킷 45%입니다.
 - KODEX S&P500과 기존 개별주는 보유 관리 대상으로 두고 신규 투자금은 배정하지 않습니다.
 
+### Guru 검증·발굴
+
+- `#guru-lab`은 기존 보유종목 점수의 짧은 파일럿과 출시 후 누적되는 Nasdaq-100 시점보존 코호트를 분리해 보여줍니다.
+- `legacy-holdings-v1`은 기존 여섯 렌즈를 보존하고, `guru-market-nasdaq-v2`는 보유비중 페널티 없이 기업점수만 계산합니다. v2는 10-K 안의 분기 누적값을 연간 성장률로 오인하지 않도록 300일 이상 흐름값만 사용합니다.
+- 후보군은 공식 Nasdaq-100 구성종목으로 고정하며, 보유종목을 제외한 Top 5를 동일가중 연구 바스켓으로 시점보존합니다.
+- 구성종목·Toss 수정주가/종목정보·SEC 접수시점 자료의 커버리지가 부족하면 이전 원장을 유지하고 새 코호트를 만들지 않습니다.
+- 점수는 연구용이며 주문 기능과 연결되지 않습니다.
+
+기존 암호화 vault 이력을 로컬 연구 원장으로 이관:
+
+```bash
+node scripts/import-guru-legacy.mjs
+```
+
+미국 월말 세션 종료 후 4일 이내에 신규 코호트 실행:
+
+```bash
+python3 scripts/run-guru-research.py --score-as-of YYYY-MM-DD
+```
+
+최초 도입 시점의 한 번뿐인 기준선은 가장 최근 완료된 미국장 종가에 고정합니다.
+
+```bash
+python3 scripts/run-guru-research.py --bootstrap-current
+```
+
+원시 점수·코호트·수정주가는 권한 `0600`의 `~/.30gogo/data/guru_research.sqlite`에만 저장됩니다. Pages에는 `guruResearch` 집계 payload가 기존 AES 암호화 vault 안에서만 전달됩니다.
+
 ## 실행 경계
 
 - GitHub Pages는 암호화된 포트폴리오의 조회와 계산만 제공합니다.
@@ -74,7 +102,8 @@ Mac이 켜져 있으면 매시 정각에 다음 순서로 실행합니다.
 
 ```bash
 node scripts/security-check.mjs
-node --test tests/qqq-core.test.cjs
+node --test tests/*.test.cjs
+python3 -m unittest discover -s tests
 ```
 
 공개 파일에는 평문 자산 JSON, 증권사 토큰·계좌 식별자, 주문 endpoint, 외부 CDN 스크립트가 포함되면 안 됩니다.

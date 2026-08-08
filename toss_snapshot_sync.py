@@ -20,6 +20,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from dashboard_strategy import apply_qqq_new_money_policy, latest_daily_change, promote_latest_guru_cache
+from guru_research import MARKET_MODEL, apply_cohort_entries, init_research_db, research_payload, set_research_meta, store_adjusted_prices, store_legacy_observations
 from performance_core import OFFICIAL_START, build_performance
 
 ROOT = Path(__file__).resolve().parent
@@ -27,6 +28,8 @@ PRIVATE_ROOT = Path.home() / ".30gogo" / "data"
 PRIVATE_SOURCE = PRIVATE_ROOT / "private-portfolio.json"
 VALUATION_CACHE_PATHS = [PRIVATE_ROOT / "valuation_cache.json", ROOT / "valuation_cache.json"]
 HISTORY_DB = PRIVATE_ROOT / "portfolio_history.sqlite"
+GURU_RESEARCH_DB = PRIVATE_ROOT / "guru_research.sqlite"
+GURU_LEGACY_CACHE = PRIVATE_ROOT / "guru_legacy_observations.json"
 VAULT = ROOT / "portfolio.vault.json"
 OPENAPI_BASE = "https://openapi.tossinvest.com"
 SEOUL = ZoneInfo("Asia/Seoul")
@@ -141,6 +144,69 @@ def load_private() -> dict:
     if not PRIVATE_SOURCE.exists():
         raise RuntimeError(f"개인 원본이 없습니다: {PRIVATE_SOURCE}")
     return json.loads(PRIVATE_SOURCE.read_text(encoding="utf-8"))
+
+
+def sync_guru_research_payload(payload: dict) -> dict:
+    imported = 0
+    with init_research_db(GURU_RESEARCH_DB) as connection:
+        if GURU_LEGACY_CACHE.exists():
+            cache = json.loads(GURU_LEGACY_CACHE.read_text(encoding="utf-8"))
+            imported = store_legacy_observations(connection, cache.get("observations") or [])
+        research = research_payload(
+            connection,
+            quote_as_of=str((payload.get("tossSnapshot") or {}).get("asOf") or payload.get("generatedAt") or ""),
+        )
+    payload["guruResearch"] = research
+    return {
+        "ok": True,
+        "legacyImported": imported,
+        "candidateCount": len(research.get("candidates") or []),
+        "dataQuality": (research.get("dataQuality") or {}).get("status"),
+    }
+
+
+def sync_guru_research_prices(client: TossReadOnlyClient) -> dict:
+    if not GURU_RESEARCH_DB.exists():
+        return {"ok": True, "updated": 0, "entriesFrozen": 0}
+    cutoff = (now_dt().date() - timedelta(days=420)).isoformat()
+    with init_research_db(GURU_RESEARCH_DB) as connection:
+        tickers = [row[0] for row in connection.execute("""
+          SELECT DISTINCT ticker FROM cohort_positions
+          WHERE model_version=? AND score_as_of>=? ORDER BY ticker
+        """, (MARKET_MODEL, cutoff)).fetchall()]
+        if not tickers:
+            return {"ok": True, "updated": 0, "entriesFrozen": 0}
+        updated = 0
+        for ticker in sorted({*tickers, "QQQ", "SPY"}):
+            try:
+                page = result(client.get("/api/v1/candles", {
+                    "symbol": ticker,
+                    "interval": "1d",
+                    "count": 5,
+                    "adjusted": "true",
+                })) or {}
+                candles = page.get("candles") if isinstance(page, dict) else []
+                updated += store_adjusted_prices(connection, ticker, candles or [])
+            except Exception:
+                continue
+            time.sleep(0.22)
+        quote_items = {}
+        try:
+            for quote in rows(client.get("/api/v1/prices", {"symbols": ",".join(tickers)})):
+                ticker = str(quote.get("symbol") or "").upper()
+                last_price = number(quote.get("lastPrice"), str(quote.get("currency") or "USD"))
+                if ticker in tickers and last_price is not None:
+                    quote_items[ticker] = {
+                        "lastPrice": last_price,
+                        "currency": str(quote.get("currency") or "USD").upper(),
+                        "timestamp": str(quote.get("timestamp") or now_dt().isoformat()),
+                    }
+        except Exception:
+            quote_items = {}
+        if quote_items:
+            set_research_meta(connection, "candidateQuotes", {"asOf": now_dt().isoformat(), "items": quote_items})
+        entries = apply_cohort_entries(connection)
+    return {"ok": updated > 0, "updated": updated, "entriesFrozen": entries, "tickerCount": len(tickers), "quoteCount": len(quote_items)}
 
 
 def update_assets(payload: dict, client: TossReadOnlyClient) -> tuple[list[dict], dict]:
@@ -467,14 +533,16 @@ def main() -> int:
     client = TossReadOnlyClient()
     assets, snapshot = update_assets(payload, client)
     guru_market_status = sync_guru_market_changes(payload, client)
+    guru_research_price_status = sync_guru_research_prices(client)
     store_snapshot(assets, snapshot["usdKrw"])
     benchmark_status = sync_qqq_benchmark(client)
     payload["assets"] = assets
     payload["generatedAt"] = now_dt().isoformat()
-    payload["schemaVersion"] = 2
+    payload["schemaVersion"] = 3
     payload["tossSnapshot"] = snapshot
     payload["portfolioHistory"] = history_payload(args.history_years)
     payload["performance"] = performance_payload(payload["portfolioHistory"])
+    guru_research_status = sync_guru_research_payload(payload)
     PRIVATE_SOURCE.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.chmod(PRIVATE_SOURCE, 0o600)
     status = publish(args.commit, args.push, snapshot["asOf"])
@@ -487,6 +555,8 @@ def main() -> int:
         "benchmark": benchmark_status,
         "guru": guru_status,
         "guruMarket": guru_market_status,
+        "guruResearch": guru_research_status,
+        "guruResearchPrices": guru_research_price_status,
         "performanceStatus": payload["performance"]["status"],
         "vault": str(VAULT),
     }, ensure_ascii=False))
