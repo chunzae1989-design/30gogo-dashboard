@@ -5,12 +5,15 @@ import unittest
 from guru_research import (
     LEGACY_MODEL,
     MARKET_MODEL,
+    CANDIDATE_COUNT,
+    CANDIDATE_WEIGHT,
+    candidate_price_trend,
     dedupe_universe,
     forward_return,
     init_research_db,
     metrics_for_horizon,
     score_market_company,
-    select_top_five,
+    select_top_candidates,
     store_market_scores,
     store_adjusted_prices,
     metrics_by_horizon_from_db,
@@ -37,7 +40,7 @@ class GuruResearchTest(unittest.TestCase):
         self.assertEqual(result["modelVersion"], MARKET_MODEL)
         self.assertEqual(result["lensCoverage"], 6)
         self.assertGreater(result["companyScore"], 50)
-        self.assertEqual(MARKET_MODEL, "guru-market-nasdaq-v2")
+        self.assertEqual(MARKET_MODEL, "guru-market-nasdaq-v3")
 
     def test_missing_core_data_is_excluded_not_defaulted(self):
         result = score_market_company({"pe": 20, "roe": 15})
@@ -53,11 +56,12 @@ class GuruResearchTest(unittest.TestCase):
         ]
         self.assertEqual([row["ticker"] for row in dedupe_universe(rows)], ["AAB", "BBB"])
 
-    def test_excludes_current_holdings_from_top_five(self):
-        rows = [{"ticker": f"T{i}", "eligible": True, "companyScore": 90 - i} for i in range(7)]
-        selected = select_top_five(rows, ["T0", "T2"])
-        self.assertEqual([row["ticker"] for row in selected], ["T1", "T3", "T4", "T5", "T6"])
-        self.assertTrue(all(row["paperWeight"] == .2 for row in selected))
+    def test_excludes_current_holdings_from_top_ten(self):
+        rows = [{"ticker": f"T{i}", "eligible": True, "companyScore": 90 - i} for i in range(12)]
+        selected = select_top_candidates(rows, ["T0", "T2"])
+        self.assertEqual([row["ticker"] for row in selected], ["T1", "T3", "T4", "T5", "T6", "T7", "T8", "T9", "T10", "T11"])
+        self.assertEqual(len(selected), CANDIDATE_COUNT)
+        self.assertTrue(all(row["paperWeight"] == CANDIDATE_WEIGHT for row in selected))
 
     def test_forward_return_uses_next_index_and_fixed_trading_days(self):
         prices = [100 + i for i in range(80)]
@@ -69,8 +73,8 @@ class GuruResearchTest(unittest.TestCase):
         self.assertEqual(metric["status"], "pending")
         self.assertEqual(metric["tradingDays"], 63)
 
-    def test_source_failure_creates_no_cohort_and_top_five_membership_is_frozen(self):
-        rows = [{"ticker": f"T{i}", "eligible": True, "companyScore": 90 - i, "scores": {}} for i in range(7)]
+    def test_source_failure_creates_no_cohort_and_top_ten_membership_is_frozen(self):
+        rows = [{"ticker": f"T{i}", "eligible": True, "companyScore": 90 - i, "scores": {}} for i in range(12)]
         with TemporaryDirectory() as directory:
             with init_research_db(Path(directory) / "guru.sqlite") as connection:
                 failed = store_market_scores(connection, "2026-07-31", rows, [], source_complete=False)
@@ -81,12 +85,12 @@ class GuruResearchTest(unittest.TestCase):
                 fixed = [row[0] for row in connection.execute("SELECT ticker FROM cohort_positions ORDER BY score DESC")]
                 store_market_scores(connection, "2026-07-31", rows, ["T0", "T1", "T2"], source_complete=True)
                 still_fixed = [row[0] for row in connection.execute("SELECT ticker FROM cohort_positions ORDER BY score DESC")]
-        self.assertEqual(fixed, ["T1", "T2", "T3", "T4", "T5"])
+        self.assertEqual(fixed, ["T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8", "T9", "T10"])
         self.assertEqual(still_fixed, fixed)
         self.assertEqual(kind, "monthly")
 
     def test_bootstrap_cohort_kind_is_frozen(self):
-        rows = [{"ticker": f"T{i}", "eligible": True, "companyScore": 90 - i, "scores": {}} for i in range(5)]
+        rows = [{"ticker": f"T{i}", "eligible": True, "companyScore": 90 - i, "scores": {}} for i in range(10)]
         with TemporaryDirectory() as directory:
             with init_research_db(Path(directory) / "guru.sqlite") as connection:
                 store_market_scores(connection, "2026-08-07", rows, [], source_complete=True, cohort_kind="bootstrap")
@@ -94,7 +98,7 @@ class GuruResearchTest(unittest.TestCase):
         self.assertEqual(kind, "bootstrap")
 
     def test_candidate_quote_is_included_in_encrypted_payload(self):
-        rows = [{"ticker": f"T{i}", "eligible": True, "companyScore": 90 - i, "scores": {}} for i in range(5)]
+        rows = [{"ticker": f"T{i}", "eligible": True, "companyScore": 90 - i, "scores": {}} for i in range(10)]
         with TemporaryDirectory() as directory:
             with init_research_db(Path(directory) / "guru.sqlite") as connection:
                 store_market_scores(connection, "2026-08-07", rows, [], source_complete=True, cohort_kind="bootstrap")
@@ -103,7 +107,7 @@ class GuruResearchTest(unittest.TestCase):
         self.assertEqual(payload["candidates"][0]["lastPrice"], 123.45)
 
     def test_price_ledger_matures_21_day_metrics_without_lookahead(self):
-        rows = [{"ticker": f"T{i}", "eligible": True, "companyScore": 90 - i, "scores": {}} for i in range(5)]
+        rows = [{"ticker": f"T{i}", "eligible": True, "companyScore": 90 - i, "scores": {}} for i in range(10)]
         with TemporaryDirectory() as directory:
             with init_research_db(Path(directory) / "guru.sqlite") as connection:
                 store_market_scores(connection, "2026-07-01", rows, [], source_complete=True)
@@ -113,11 +117,12 @@ class GuruResearchTest(unittest.TestCase):
                     store_adjusted_prices(connection, benchmark, [{"date": f"2026-07-{day:02}", "adjustedClose": 200 + day} for day in range(2, 24)])
                 metrics = metrics_by_horizon_from_db(connection)
         self.assertEqual(metrics["1M"]["status"], "ready")
-        self.assertEqual(metrics["1M"]["sampleSize"], 5)
+        self.assertEqual(metrics["1M"]["sampleSize"], 10)
+        self.assertIsNotNone(metrics["1M"]["top10Return"])
         self.assertIsNotNone(metrics["1M"]["excessVsQqq"])
 
     def test_cohort_entry_uses_first_common_trading_day_after_signal(self):
-        rows = [{"ticker": f"T{i}", "eligible": True, "companyScore": 90 - i, "scores": {}} for i in range(5)]
+        rows = [{"ticker": f"T{i}", "eligible": True, "companyScore": 90 - i, "scores": {}} for i in range(10)]
         with TemporaryDirectory() as directory:
             with init_research_db(Path(directory) / "guru.sqlite") as connection:
                 store_market_scores(connection, "2026-07-31", rows, [], source_complete=True)
@@ -134,6 +139,19 @@ class GuruResearchTest(unittest.TestCase):
         self.assertEqual(completed, 1)
         self.assertEqual(tuple(cohort), ("2026-08-04", "tracking"))
         self.assertTrue(all(row[0] is not None for row in entry_prices))
+
+    def test_candidate_price_trend_has_trailing_returns_and_score_marker(self):
+        with TemporaryDirectory() as directory:
+            with init_research_db(Path(directory) / "guru.sqlite") as connection:
+                store_adjusted_prices(connection, "AAA", [
+                    {"date": f"2026-{1 + index // 28:02}-{1 + index % 28:02}", "adjustedClose": 100 + index}
+                    for index in range(64)
+                ])
+                trend = candidate_price_trend(connection, "AAA", "2026-02-28")
+        self.assertEqual(len(trend["points"]), 64)
+        self.assertEqual(trend["scoreAsOf"], "2026-02-28")
+        self.assertIsNotNone(trend["returns"]["1M"])
+        self.assertIsNotNone(trend["sinceScore"])
 
     def test_legacy_model_is_separate_and_deduplicated(self):
         with TemporaryDirectory() as directory:

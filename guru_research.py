@@ -18,7 +18,9 @@ from statistics import mean
 from typing import Iterable
 
 LEGACY_MODEL = "legacy-holdings-v1"
-MARKET_MODEL = "guru-market-nasdaq-v2"
+MARKET_MODEL = "guru-market-nasdaq-v3"
+CANDIDATE_COUNT = 10
+CANDIDATE_WEIGHT = 1 / CANDIDATE_COUNT
 LENSES = ("Buffett", "Lynch", "Graham", "Greenblatt", "Innovation", "Momentum")
 HORIZONS = {"1M": 21, "3M": 63, "6M": 126, "12M": 252}
 REQUIRED_GROUPS = {
@@ -177,11 +179,11 @@ def dedupe_universe(rows: Iterable[dict]) -> list[dict]:
     return sorted([*by_cik.values(), *no_cik], key=lambda row: row["ticker"])
 
 
-def select_top_five(scored: Iterable[dict], held_tickers: Iterable[str]) -> list[dict]:
+def select_top_candidates(scored: Iterable[dict], held_tickers: Iterable[str]) -> list[dict]:
     held = {str(ticker).upper() for ticker in held_tickers}
     eligible = [dict(row) for row in scored if row.get("eligible") and str(row.get("ticker", "")).upper() not in held]
     eligible.sort(key=lambda row: (-float(row.get("companyScore") or 0), str(row.get("ticker") or "")))
-    return [{**row, "paperWeight": 0.2, "researchOnly": True} for row in eligible[:5]]
+    return [{**row, "paperWeight": CANDIDATE_WEIGHT, "researchOnly": True} for row in eligible[:CANDIDATE_COUNT]]
 
 
 def rank(values: list[float]) -> list[float]:
@@ -226,8 +228,8 @@ def metrics_for_horizon(rows: Iterable[dict], horizon: str) -> dict:
     sorted_rows = sorted(matured, key=lambda row: row["companyScore"])
     bucket = max(1, math.ceil(len(sorted_rows) * 0.2)) if sorted_rows else 0
     spread = None if not sorted_rows else mean(row["return"] for row in sorted_rows[-bucket:]) - mean(row["return"] for row in sorted_rows[:bucket])
-    top5 = [row for row in matured if row.get("top5")]
-    hit_rate = None if not top5 else sum(1 for row in top5 if row["return"] > 0) / len(top5)
+    top10 = [row for row in matured if row.get("top10")]
+    hit_rate = None if not top10 else sum(1 for row in top10 if row["return"] > 0) / len(top10)
     score_buckets = []
     for low, high in ((0, 39), (40, 59), (60, 79), (80, 100)):
         values = [row["return"] for row in matured if low <= row["companyScore"] <= high]
@@ -243,7 +245,7 @@ def metrics_for_horizon(rows: Iterable[dict], horizon: str) -> dict:
         "sampleSize": len(matured),
         "spearman": spearman(pairs),
         "topBottomSpread": spread,
-        "top5HitRate": hit_rate,
+        "top10HitRate": hit_rate,
         "scoreBuckets": score_buckets,
     }
 
@@ -338,20 +340,21 @@ def store_market_scores(
     source_complete: bool,
     cohort_kind: str = "monthly",
 ) -> dict:
-    """Freeze a monthly score set and its Top 5 membership atomically."""
+    """Freeze a monthly score set and its Top 10 membership atomically."""
     if not source_complete:
         return {"created": False, "reason": "source coverage failed"}
     if connection.execute("SELECT 1 FROM cohorts WHERE model_version=? AND score_as_of=?", (MARKET_MODEL, score_as_of)).fetchone():
         return {"created": False, "reason": "cohort already frozen"}
     rows = [dict(row) for row in scored]
-    selected = select_top_five(rows, held_tickers)
-    if len(selected) != 5:
-        return {"created": False, "reason": "fewer than five eligible unheld companies"}
+    selected = select_top_candidates(rows, held_tickers)
+    if len(selected) != CANDIDATE_COUNT:
+        return {"created": False, "reason": "fewer than ten eligible unheld companies"}
     rank_by_ticker = {row["ticker"]: index + 1 for index, row in enumerate(selected)}
     connection.execute("BEGIN")
     try:
         for row in rows:
             row["candidateRank"] = rank_by_ticker.get(str(row.get("ticker") or "").upper())
+            row["paperWeight"] = CANDIDATE_WEIGHT if row["candidateRank"] else None
             connection.execute("""
               INSERT INTO scores(model_version,score_as_of,ticker,company_score,eligible,payload_json)
               VALUES(?,?,?,?,?,?) ON CONFLICT(model_version,score_as_of,ticker) DO UPDATE SET
@@ -364,13 +367,13 @@ def store_market_scores(
         for row in selected:
             connection.execute("""
               INSERT INTO cohort_positions(model_version,score_as_of,ticker,score,entry_price,weight,held_at_signal)
-              VALUES(?,?,?,?,NULL,0.2,0) ON CONFLICT(model_version,score_as_of,ticker) DO NOTHING
-            """, (MARKET_MODEL, score_as_of, row["ticker"], row["companyScore"]))
+              VALUES(?,?,?,?,NULL,?,0) ON CONFLICT(model_version,score_as_of,ticker) DO NOTHING
+            """, (MARKET_MODEL, score_as_of, row["ticker"], row["companyScore"], CANDIDATE_WEIGHT))
         connection.commit()
     except Exception:
         connection.rollback()
         raise
-    return {"created": True, "scoreCount": len(rows), "candidateCount": 5}
+    return {"created": True, "scoreCount": len(rows), "candidateCount": CANDIDATE_COUNT}
 
 
 def store_adjusted_prices(connection: sqlite3.Connection, ticker: str, rows: Iterable[dict], source: str = "Toss OpenAPI adjusted daily") -> int:
@@ -403,7 +406,7 @@ def apply_cohort_entries(connection: sqlite3.Connection) -> int:
             "SELECT ticker FROM cohort_positions WHERE model_version=? AND score_as_of=? ORDER BY ticker",
             (MARKET_MODEL, score_as_of),
         ).fetchall()]
-        if len(tickers) != 5:
+        if len(tickers) != CANDIDATE_COUNT:
             continue
         dates_by_ticker = []
         for ticker in tickers:
@@ -491,7 +494,7 @@ def metrics_by_horizon_from_db(connection: sqlite3.Connection) -> dict:
                 elapsed = max(elapsed, max(0, len(series) - 1))
                 value = forward_return([item[1] for item in series], 0, trading_days)
                 if value is not None:
-                    observation = {"companyScore": row["companyScore"], "return": value, "top5": bool(row.get("candidateRank"))}
+                    observation = {"companyScore": row["companyScore"], "return": value, "top10": bool(row.get("candidateRank"))}
                     observations.append(observation)
                     date_observations.append(observation)
                     if row.get("candidateRank"):
@@ -499,13 +502,13 @@ def metrics_by_horizon_from_db(connection: sqlite3.Connection) -> dict:
             matured = [row["return"] for row in date_observations if row.get("return") is not None]
             if matured:
                 universe_returns.append(mean(matured))
-            if len(cohort) == 5:
+            if len(cohort) == CANDIDATE_COUNT:
                 cohort_returns.append(mean(cohort))
                 top_series = [
                     _series_from(connection, row["ticker"], entry_date) if entry_date else _series(connection, row["ticker"], score_date)
                     for row in rows if row.get("candidateRank")
                 ]
-                if len(top_series) == 5 and min(map(len, top_series)) > 1:
+                if len(top_series) == CANDIDATE_COUNT and min(map(len, top_series)) > 1:
                     length = min(min(map(len, top_series)), trading_days + 1)
                     normalized = [mean(series[index][1] / series[0][1] for series in top_series) for index in range(length)]
                     drawdowns.append(_max_drawdown(normalized))
@@ -516,7 +519,7 @@ def metrics_by_horizon_from_db(connection: sqlite3.Connection) -> dict:
                     target.append(value)
         metric = metrics_for_horizon(observations, horizon)
         metric["elapsedTradingDays"] = min(trading_days, elapsed)
-        metric["top5Return"] = mean(cohort_returns) if cohort_returns else None
+        metric["top10Return"] = mean(cohort_returns) if cohort_returns else None
         metric["universeReturn"] = mean(universe_returns) if universe_returns else None
         metric["qqqReturn"] = mean(qqq_returns) if qqq_returns else None
         metric["spyReturn"] = mean(spy_returns) if spy_returns else None
@@ -559,6 +562,32 @@ def legacy_validation(connection: sqlite3.Connection) -> dict:
     }
 
 
+def candidate_price_trend(connection: sqlite3.Connection, ticker: str, score_as_of: str) -> dict:
+    rows = connection.execute("""
+      SELECT price_date,adjusted_close FROM price_observations
+      WHERE ticker=? ORDER BY price_date DESC LIMIT 260
+    """, (str(ticker).upper(),)).fetchall()
+    points = [{"date": row[0], "close": float(row[1])} for row in reversed(rows)]
+    if not points:
+        return {"points": [], "returns": {}, "scoreAsOf": score_as_of}
+
+    prices = [point["close"] for point in points]
+    trailing = {}
+    for horizon, trading_days in HORIZONS.items():
+        trailing[horizon] = None if len(prices) <= trading_days else prices[-1] / prices[-trading_days - 1] - 1
+    score_point = next((point for point in reversed(points) if point["date"] <= score_as_of), None)
+    return {
+        "points": points,
+        "asOf": points[-1]["date"],
+        "scoreAsOf": score_as_of,
+        "scorePrice": None if not score_point else score_point["close"],
+        "sinceScore": None if not score_point else points[-1]["close"] / score_point["close"] - 1,
+        "low52": min(prices),
+        "high52": max(prices),
+        "returns": trailing,
+    }
+
+
 def research_payload(connection: sqlite3.Connection, *, score_as_of: str = "", quote_as_of: str = "") -> dict:
     latest_universe = connection.execute("SELECT MAX(as_of) FROM universe_members").fetchone()[0]
     universe_rows = [] if not latest_universe else connection.execute("SELECT ticker,name,cik,sources FROM universe_members WHERE as_of=? ORDER BY ticker", (latest_universe,)).fetchall()
@@ -571,7 +600,9 @@ def research_payload(connection: sqlite3.Connection, *, score_as_of: str = "", q
         if quote:
             row["lastPrice"] = quote.get("lastPrice")
             row["quoteTimestamp"] = quote.get("timestamp")
-    candidates = [row for row in score_rows if row.get("candidateRank") in (1, 2, 3, 4, 5)]
+    candidates = [row for row in score_rows if 1 <= int(row.get("candidateRank") or 0) <= CANDIDATE_COUNT]
+    for row in candidates:
+        row["priceTrend"] = candidate_price_trend(connection, row["ticker"], score_date)
     cohorts = [dict(row) for row in connection.execute("SELECT * FROM cohorts WHERE model_version=? ORDER BY score_as_of DESC", (MARKET_MODEL,)).fetchall()]
     completeness = 0 if not score_rows else round(sum(float(row.get("dataCompleteness") or 0) for row in score_rows) / len(score_rows), 1)
     universe_status = get_research_meta(connection, "universeStatus")

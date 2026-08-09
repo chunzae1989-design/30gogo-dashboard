@@ -356,7 +356,7 @@ class GuruMarketPipeline:
             cohort_kind=cohort_kind,
         )
         if cohort.get("created"):
-            message = "Nasdaq-100 최초 기준선과 미보유 Top 5를 고정했습니다." if cohort_kind == "bootstrap" else "Nasdaq-100 월말 점수 원장과 미보유 Top 5를 고정했습니다."
+            message = "Nasdaq-100 최초 기준선과 미보유 Top 10을 고정했습니다." if cohort_kind == "bootstrap" else "Nasdaq-100 월말 점수 원장과 미보유 Top 10을 고정했습니다."
         else:
             message = str(cohort.get("reason") or "새 코호트를 만들지 않았습니다.")
         pipeline_status = {
